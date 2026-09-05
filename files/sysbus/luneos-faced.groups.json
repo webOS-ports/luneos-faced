@@ -1,0 +1,5 @@
+{
+ "allowedNames": ["com.webos.service.faceunlock"],
+ "faceunlock.operation": ["dev"],
+ "faceunlock.query": ["dev"]
+}

@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=com.webos.service.faceunlock
+Exec=@WEBOS_INSTALL_SBINDIR@/luneos-faced
+Type=static

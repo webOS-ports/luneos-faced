@@ -1,0 +1,13 @@
+{
+    "exeName":"@WEBOS_INSTALL_SBINDIR@/luneos-faced",
+    "trustLevel": "oem",
+    "type": "privileged",
+    "allowedNames": ["com.webos.service.faceunlock"],
+    "permissions": [
+        {
+            "service":"com.webos.service.faceunlock",
+            "inbound":["*"],
+            "outbound":["*"]
+        }
+    ]
+}

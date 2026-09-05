@@ -1,0 +1,5 @@
+# externalsrc drops these symlinks into the source tree when bitbake builds it
+# straight out of a working copy.
+/oe-logs
+/oe-workdir
+/build/

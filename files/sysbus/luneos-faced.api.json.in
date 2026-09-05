@@ -1,0 +1,12 @@
+{
+    "faceunlock.operation": [
+        "com.webos.service.faceunlock/getStatus",
+        "com.webos.service.faceunlock/enroll",
+        "com.webos.service.faceunlock/identify",
+        "com.webos.service.faceunlock/abort",
+        "com.webos.service.faceunlock/clear"
+    ],
+    "faceunlock.query": [
+        "com.webos.service.faceunlock/getStatus"
+    ]
+}

@@ -1,0 +1,12 @@
+{
+    "com.webos.service.faceunlock": [
+        "faceunlock.operation",
+        "faceunlock.query",
+        "camera.query",
+        "camera.operation"
+    ],
+    "com.webos.surfacemanager*": [
+        "faceunlock.operation",
+        "faceunlock.query"
+    ]
+}

@@ -1,0 +1,16 @@
+[Unit]
+Description=LuneOS face unlock service
+Requires=ls-hubd.service
+After=ls-hubd.service com.webos.service.camera.service
+Wants=com.webos.service.camera.service
+
+[Service]
+Type=simple
+Restart=on-failure
+ExecStart=/usr/sbin/luneos-faced
+# Templates and the data key live here, root-only.
+StateDirectory=luneos-faced
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

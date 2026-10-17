@@ -78,8 +78,15 @@ a statistical one.
 | `abort` | no | cancels the running operation |
 | `clear` | no | removes the enrollment |
 
-ACGs: `faceunlock.operation` (all methods) and `faceunlock.query` (`getStatus`).
-`com.webos.surfacemanager*` is granted both, as with fingerprint.
+ACGs: `faceunlock.operation` (all methods), `faceunlock.identify`
+(`getStatus`, `identify`, `abort`) and `faceunlock.query` (`getStatus`).
+`com.webos.surfacemanager*` is granted `faceunlock.operation` and
+`faceunlock.query`, as with fingerprint. An app that only lets its user in
+with a face asks for `faceunlock.identify`, which cannot enroll or clear.
+
+Identify updates go to every subscriber of `identify`, so such an app keeps
+its subscription only while it is in front, and cancels it (and `abort`s)
+when it is not.
 
 `identify` does not distinguish a genuine mismatch from a spoof rejection.
 libfart does not report the difference, and telling an attacker which one it was

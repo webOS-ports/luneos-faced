@@ -1,5 +1,6 @@
 {
  "allowedNames": ["com.webos.service.faceunlock"],
  "faceunlock.operation": ["dev"],
+ "faceunlock.identify": ["dev"],
  "faceunlock.query": ["dev"]
 }

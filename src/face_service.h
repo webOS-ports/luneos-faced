@@ -61,16 +61,18 @@ private:
 
     // Main loop only: the token for a recognized face, a miss reported.
     static bool cbUnlockTokenIssued(LSHandle *sh, LSMessage *reply, void *ctx);
-    void requestUnlockToken(const std::string &requester);
+    // call: the identify call the match belongs to, one reference that
+    // requestUnlockToken hands on and its reply drops.
+    void requestUnlockToken(LSMessage *call);
     void reportFailure();
-    void postIdentified(const std::string &token);
 
     // Runs fn on the main loop, where every LS2 call is made.
     void onMainLoop(std::function<void()> fn);
     void runEnroll();
-    // requester: who asked to identify; luna-authmanager binds the unlock
-    // token for a match to it.
-    void runIdentify(const std::string &requester);
+    // call: the identify call (LSMessageRef'd on the main loop). The token
+    // for a match is bound to its sender and posted on its subscription only.
+    // The worker never touches it; every LS2 call stays on the main loop.
+    void runIdentify(LSMessage *call);
     void finish();
 
     // Posts to everyone subscribed to `method`, on the main loop.

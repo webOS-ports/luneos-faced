@@ -28,7 +28,9 @@ keeps one budget across passcode, fingerprint and face:
 
 - A recognized face is answered with the unlock token luna-authmanager issues
   (`issueBiometricToken`) for whoever called `identify`, posted as
-  `unlockToken`; the lock screen hands it to `com.palm.display/control/setLockStatus`.
+  `unlockToken` on that caller's subscription only (every other `identify`
+  subscriber gets the same update without it); the lock screen hands it to
+  `com.palm.display/control/setLockStatus`.
   When luna-authmanager will not issue one (no passcode since boot, five misses
   in a row, a passcode lockout, 72 h since the passcode was last entered) the
   update carries `"passcodeRequired": true` instead.
@@ -100,6 +102,12 @@ when it is not.
 `identify` does not distinguish a genuine mismatch from a spoof rejection.
 libfart does not report the difference, and telling an attacker which one it was
 would be a gift.
+
+## Tests
+
+`cmake -DBUILD_TESTING=ON` builds `faced-tests` (gtest): `src/identify_post.cpp`
+against a fake libluna-service2 (`tests/fake_ls2.cpp`), which checks that the
+unlock token goes to the identify caller's subscription and no other.
 
 ## Build dependencies
 

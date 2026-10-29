@@ -4,6 +4,7 @@
 #include "face_service.h"
 #include "camera_source.h"
 #include "frame_orientation.h"
+#include "identify_post.h"
 
 #include <string.h> // explicit_bzero
 
@@ -176,29 +177,16 @@ void FaceService::onMainLoop(std::function<void()> fn)
     g_main_context_invoke_full(context_, G_PRIORITY_DEFAULT, runOnMainLoop, job, nullptr);
 }
 
-void FaceService::postIdentified(const std::string &token)
+struct TokenRequest
 {
-    json reply{{"returnValue", true}, {"recognized", true}};
-    if (token.empty())
-        reply["passcodeRequired"] = true;
-    else
-        reply["unlockToken"] = token;
-    std::string text = reply.dump();
-    LSError err;
-    LSErrorInit(&err);
-    if (!LSSubscriptionPost(handle_, "/", "identify", text.c_str(), &err))
-    {
-        g_warning("LSSubscriptionPost(identify): %s", err.message);
-        LSErrorFree(&err);
-    }
-    wipe(text);
-    if (reply.contains("unlockToken"))
-        wipe(reply["unlockToken"].get_ref<std::string &>());
-}
+    FaceService *self;
+    LSHandle *handle;
+    LSMessage *call;
+};
 
 bool FaceService::cbUnlockTokenIssued(LSHandle *, LSMessage *reply, void *ctx)
 {
-    auto *self = static_cast<FaceService *>(ctx);
+    std::unique_ptr<TokenRequest> request(static_cast<TokenRequest *>(ctx));
     json j = parsePayload(reply);
     std::string token;
     const auto it = j.find("unlockToken");
@@ -206,24 +194,30 @@ bool FaceService::cbUnlockTokenIssued(LSHandle *, LSMessage *reply, void *ctx)
         token = it->get<std::string>();
     if (token.empty())
         g_message("identify: a face matched, but luna-authmanager wants the passcode");
-    self->postIdentified(token);
+    identify::postMatch(request->handle, request->call, token);
+    LSMessageUnref(request->call);
     wipe(token);
     if (it != j.end() && it->is_string())
         wipe(it->get_ref<std::string &>());
     return true;
 }
 
-void FaceService::requestUnlockToken(const std::string &requester)
+void FaceService::requestUnlockToken(LSMessage *call)
 {
-    const std::string payload = json{{"factor", "face"}, {"requester", requester}}.dump();
+    const char *sender = LSMessageGetSenderServiceName(call);
+    const std::string payload =
+        json{{"factor", "face"}, {"requester", sender ? sender : ""}}.dump();
+    auto *request = new TokenRequest{this, handle_, call};
     LSError err;
     LSErrorInit(&err);
-    if (!LSCallOneReply(handle_, kIssueUri, payload.c_str(), cbUnlockTokenIssued, this, nullptr,
-                        &err))
+    if (!LSCallOneReply(handle_, kIssueUri, payload.c_str(), cbUnlockTokenIssued, request,
+                        nullptr, &err))
     {
         g_warning("identify: cannot ask luna-authmanager for an unlock token: %s", err.message);
         LSErrorFree(&err);
-        postIdentified(std::string());
+        identify::postMatch(handle_, call, std::string());
+        LSMessageUnref(call);
+        delete request;
     }
 }
 
@@ -268,9 +262,8 @@ bool FaceService::beginOperation(State want, LSMessage *msg)
         worker_ = std::thread([this] { runEnroll(); });
     else
     {
-        const char *sender = LSMessageGetSenderServiceName(msg);
-        std::string requester = sender ? sender : "";
-        worker_ = std::thread([this, requester] { runIdentify(requester); });
+        LSMessageRef(msg);
+        worker_ = std::thread([this, msg] { runIdentify(msg); });
     }
 
     postStatus();
@@ -283,8 +276,27 @@ void FaceService::finish()
     postStatus();
 }
 
-void FaceService::runIdentify(const std::string &requester)
+void FaceService::runIdentify(LSMessage *call)
 {
+    // Drops the reference to call on the main loop, unless it was handed on
+    // to requestUnlockToken.
+    struct CallRef
+    {
+        FaceService *self;
+        LSMessage *call;
+        ~CallRef()
+        {
+            if (call)
+                self->onMainLoop([c = call] { LSMessageUnref(c); });
+        }
+        LSMessage *release()
+        {
+            LSMessage *c = call;
+            call = nullptr;
+            return c;
+        }
+    } ref{this, call};
+
     CameraSource camera(handle_);
     if (!camera.start(kWidth, kHeight))
     {
@@ -369,7 +381,7 @@ void FaceService::runIdentify(const std::string &requester)
         {
             const gint64 matchedAt = g_get_monotonic_time();
             // Posted once luna-authmanager has answered, with its token
-            onMainLoop([this, requester] { requestUnlockToken(requester); });
+            onMainLoop([this, c = ref.release()] { requestUnlockToken(c); });
             camera.stop();
             g_message("identify: recognized, teardown took %" G_GINT64_FORMAT "ms",
                       (g_get_monotonic_time() - matchedAt) / 1000);

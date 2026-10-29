@@ -3,7 +3,9 @@
         "faceunlock.operation",
         "faceunlock.query",
         "camera.query",
-        "camera.operation"
+        "camera.operation",
+        "auth.biometric",
+        "auth.unlocktoken"
     ],
     "com.webos.surfacemanager*": [
         "faceunlock.operation",

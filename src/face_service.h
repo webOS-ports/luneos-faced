@@ -7,15 +7,16 @@
 // drive both the same way. Like the fingerprint adapter this is a *sensor*
 // adapter, not an authentication authority: it reports "this face matched", it
 // does not decide whether the device unlocks, and it owns no retry budget. That
-// policy belongs in luna-authmanager (the Security/EASPolicyManager carve-out
-// from luna-sysmgr), which will own one lockout budget across passcode,
-// fingerprint and face. Until it exists the shell still counts attempts, which
-// is exactly the defect luna-authmanager is meant to fix - so face unlock should
-// not ship enabled by default before then.
+// policy belongs to luna-authmanager, which owns one budget across passcode,
+// fingerprint and face: a recognized face is answered with the unlock token
+// luna-authmanager issues for whoever asked to identify (or with
+// "passcodeRequired" when it will not), every miss is reported to it, and
+// enrolling takes a token from the passcode.
 
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
@@ -52,8 +53,24 @@ private:
     static bool cbClear(LSHandle *sh, LSMessage *msg, void *ctx);
 
     bool beginOperation(State want, LSMessage *msg);
+
+    // Enrolling takes the passcode: the caller's token is spent through
+    // luna-authmanager before the camera starts.
+    static bool cbEnrollTokenSpent(LSHandle *sh, LSMessage *reply, void *ctx);
+    void startEnroll(LSHandle *sh, LSMessage *msg);
+
+    // Main loop only: the token for a recognized face, a miss reported.
+    static bool cbUnlockTokenIssued(LSHandle *sh, LSMessage *reply, void *ctx);
+    void requestUnlockToken(const std::string &requester);
+    void reportFailure();
+    void postIdentified(const std::string &token);
+
+    // Runs fn on the main loop, where every LS2 call is made.
+    void onMainLoop(std::function<void()> fn);
     void runEnroll();
-    void runIdentify();
+    // requester: who asked to identify; luna-authmanager binds the unlock
+    // token for a match to it.
+    void runIdentify(const std::string &requester);
     void finish();
 
     // Posts to everyone subscribed to `method`, on the main loop.

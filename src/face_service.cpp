@@ -5,6 +5,8 @@
 #include "camera_source.h"
 #include "frame_orientation.h"
 
+#include <string.h> // explicit_bzero
+
 #include <glib.h>
 #include <nlohmann/json.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -61,6 +63,46 @@ std::string errorReply(const char *text)
 {
     return json{{"returnValue", false}, {"errorText", text}}.dump();
 }
+
+constexpr const char *kIssueUri   = "luna://com.webos.service.auth/issueBiometricToken";
+constexpr const char *kFailureUri = "luna://com.webos.service.auth/reportBiometricFailure";
+constexpr const char *kConsumeUri = "luna://com.webos.service.auth/consumeUnlockToken";
+constexpr const char *kNeedsPasscode = "Enrolling a face takes the passcode";
+
+gboolean runOnMainLoop(gpointer data)
+{
+    std::unique_ptr<std::function<void()>> fn(static_cast<std::function<void()> *>(data));
+    (*fn)();
+    return G_SOURCE_REMOVE;
+}
+
+// A token, or a payload that carried one, is wiped before it is dropped
+void wipe(std::string &text)
+{
+    if (!text.empty())
+        explicit_bzero(&text[0], text.size());
+    text.clear();
+}
+
+json parsePayload(LSMessage *msg)
+{
+    const char *payload = LSMessageGetPayload(msg);
+    json j = json::parse(payload ? payload : "", nullptr, false);
+    return j.is_object() ? j : json::object();
+}
+
+bool isTrue(const json &j, const char *key)
+{
+    const auto it = j.find(key);
+    return it != j.end() && it->is_boolean() && it->get<bool>();
+}
+
+struct EnrollJob
+{
+    FaceService *self;
+    LSHandle *handle;
+    LSMessage *message;
+};
 } // namespace
 
 const char *FaceService::stateName(State s)
@@ -128,6 +170,75 @@ bool FaceService::start()
     return true;
 }
 
+void FaceService::onMainLoop(std::function<void()> fn)
+{
+    auto *job = new std::function<void()>(std::move(fn));
+    g_main_context_invoke_full(context_, G_PRIORITY_DEFAULT, runOnMainLoop, job, nullptr);
+}
+
+void FaceService::postIdentified(const std::string &token)
+{
+    json reply{{"returnValue", true}, {"recognized", true}};
+    if (token.empty())
+        reply["passcodeRequired"] = true;
+    else
+        reply["unlockToken"] = token;
+    std::string text = reply.dump();
+    LSError err;
+    LSErrorInit(&err);
+    if (!LSSubscriptionPost(handle_, "/", "identify", text.c_str(), &err))
+    {
+        g_warning("LSSubscriptionPost(identify): %s", err.message);
+        LSErrorFree(&err);
+    }
+    wipe(text);
+    if (reply.contains("unlockToken"))
+        wipe(reply["unlockToken"].get_ref<std::string &>());
+}
+
+bool FaceService::cbUnlockTokenIssued(LSHandle *, LSMessage *reply, void *ctx)
+{
+    auto *self = static_cast<FaceService *>(ctx);
+    json j = parsePayload(reply);
+    std::string token;
+    const auto it = j.find("unlockToken");
+    if (isTrue(j, "returnValue") && it != j.end() && it->is_string())
+        token = it->get<std::string>();
+    if (token.empty())
+        g_message("identify: a face matched, but luna-authmanager wants the passcode");
+    self->postIdentified(token);
+    wipe(token);
+    if (it != j.end() && it->is_string())
+        wipe(it->get_ref<std::string &>());
+    return true;
+}
+
+void FaceService::requestUnlockToken(const std::string &requester)
+{
+    const std::string payload = json{{"factor", "face"}, {"requester", requester}}.dump();
+    LSError err;
+    LSErrorInit(&err);
+    if (!LSCallOneReply(handle_, kIssueUri, payload.c_str(), cbUnlockTokenIssued, this, nullptr,
+                        &err))
+    {
+        g_warning("identify: cannot ask luna-authmanager for an unlock token: %s", err.message);
+        LSErrorFree(&err);
+        postIdentified(std::string());
+    }
+}
+
+void FaceService::reportFailure()
+{
+    LSError err;
+    LSErrorInit(&err);
+    if (!LSCallOneReply(handle_, kFailureUri, R"({"factor":"face"})", nullptr, nullptr, nullptr,
+                        &err))
+    {
+        g_warning("identify: cannot report a miss to luna-authmanager: %s", err.message);
+        LSErrorFree(&err);
+    }
+}
+
 void FaceService::post(const std::string &method, const std::string &payload)
 {
     auto *job = new PostJob{this, handle_, method, payload, g_get_monotonic_time()};
@@ -156,7 +267,11 @@ bool FaceService::beginOperation(State want, LSMessage *msg)
     if (want == State::Enrolling)
         worker_ = std::thread([this] { runEnroll(); });
     else
-        worker_ = std::thread([this] { runIdentify(); });
+    {
+        const char *sender = LSMessageGetSenderServiceName(msg);
+        std::string requester = sender ? sender : "";
+        worker_ = std::thread([this, requester] { runIdentify(requester); });
+    }
 
     postStatus();
     return true;
@@ -168,7 +283,7 @@ void FaceService::finish()
     postStatus();
 }
 
-void FaceService::runIdentify()
+void FaceService::runIdentify(const std::string &requester)
 {
     CameraSource camera(handle_);
     if (!camera.start(kWidth, kHeight))
@@ -253,7 +368,8 @@ void FaceService::runIdentify()
         if (last == RECOGNITION_RECOGNIZED)
         {
             const gint64 matchedAt = g_get_monotonic_time();
-            post("identify", json{{"returnValue", true}, {"recognized", true}}.dump());
+            // Posted once luna-authmanager has answered, with its token
+            onMainLoop([this, requester] { requestUnlockToken(requester); });
             camera.stop();
             g_message("identify: recognized, teardown took %" G_GINT64_FORMAT "ms",
                       (g_get_monotonic_time() - matchedAt) / 1000);
@@ -279,6 +395,10 @@ void FaceService::runIdentify()
     // presentation-attack rejection from MiniFASNet. libfart does not
     // distinguish them, and deliberately telling an attacker which one it was
     // would be a gift, so the shell should treat both the same.
+    // A face that was seen and did not match counts against the budget
+    // luna-authmanager shares with the fingerprint and the passcode.
+    if (!cancel_ && last == RECOGNITION_NOT_RECOGNIZED)
+        onMainLoop([this] { reportFailure(); });
     post("identify",
          json{{"returnValue", true}, {"recognized", false}, {"reason", reason}}.dump());
     finish();
@@ -428,17 +548,72 @@ bool FaceService::cbEnroll(LSHandle *sh, LSMessage *msg, void *ctx)
         LSMessageReply(sh, msg, errorReply("face engine unavailable").c_str(), &err);
         return true;
     }
+
+    // "token": the unlockToken luna-authmanager's matchDevicePasscode gave
+    // this caller. Spent there (purpose "enroll") before the camera starts.
+    json request = parsePayload(msg);
+    const auto it = request.find("token");
+    const char *requester = LSMessageGetSenderServiceName(msg);
+    if (it == request.end() || !it->is_string() || it->get_ref<const std::string &>().empty() ||
+        !requester || !*requester)
+    {
+        LSMessageReply(sh, msg, errorReply(kNeedsPasscode).c_str(), &err);
+        if (it != request.end() && it->is_string())
+            wipe(it->get_ref<std::string &>());
+        return true;
+    }
+
+    std::string payload = json{{"token", it->get_ref<const std::string &>()},
+                               {"requester", requester},
+                               {"purpose", "enroll"}}
+                              .dump();
+    wipe(it->get_ref<std::string &>());
+
+    auto *job = new EnrollJob{self, sh, msg};
+    LSMessageRef(msg);
+    const bool called =
+        LSCallOneReply(sh, kConsumeUri, payload.c_str(), cbEnrollTokenSpent, job, nullptr, &err);
+    wipe(payload);
+    if (!called)
+    {
+        g_warning("enroll: cannot reach luna-authmanager: %s", err.message);
+        LSErrorFree(&err);
+        LSMessageReply(sh, msg, errorReply(kNeedsPasscode).c_str(), nullptr);
+        LSMessageUnref(msg);
+        delete job;
+    }
+    return true;
+}
+
+bool FaceService::cbEnrollTokenSpent(LSHandle *, LSMessage *reply, void *ctx)
+{
+    std::unique_ptr<EnrollJob> job(static_cast<EnrollJob *>(ctx));
+    const json j = parsePayload(reply);
+
+    if (isTrue(j, "returnValue") && isTrue(j, "valid"))
+        job->self->startEnroll(job->handle, job->message);
+    else
+        LSMessageReply(job->handle, job->message, errorReply(kNeedsPasscode).c_str(), nullptr);
+
+    LSMessageUnref(job->message);
+    return true;
+}
+
+void FaceService::startEnroll(LSHandle *sh, LSMessage *msg)
+{
+    LSError err;
+    LSErrorInit(&err);
+
     bool subscribed = false;
     if (LSMessageIsSubscription(msg) && !LSSubscriptionProcess(sh, msg, &subscribed, &err))
         LSErrorFree(&err);
 
-    if (!self->beginOperation(State::Enrolling, msg))
+    if (!beginOperation(State::Enrolling, msg))
     {
-        LSMessageReply(sh, msg, errorReply("another operation is in progress").c_str(), &err);
-        return true;
+        LSMessageReply(sh, msg, errorReply("another operation is in progress").c_str(), nullptr);
+        return;
     }
-    LSMessageReply(sh, msg, json{{"returnValue", true}, {"progress", 0}}.dump().c_str(), &err);
-    return true;
+    LSMessageReply(sh, msg, json{{"returnValue", true}, {"progress", 0}}.dump().c_str(), nullptr);
 }
 
 bool FaceService::cbIdentify(LSHandle *sh, LSMessage *msg, void *ctx)

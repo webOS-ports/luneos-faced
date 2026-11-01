@@ -23,12 +23,23 @@ It deliberately does **not**:
 - own a retry budget or lockout state,
 - know anything about the passcode.
 
-That is authentication *policy*, and it belongs in `luna-authmanager`, the
-`Security` + `EASPolicyManager` carve-out from luna-sysmgr. Today that policy is
-spread across `LockScreen.qml` (`maxFingerprintAttempts = 5`) and `Security.cpp`
-(`s_defaultMaxRetries = 3`), which do not know about each other. Adding face as a
-third independent counter makes that worse, which is why **face unlock should not
-ship enabled by default until luna-authmanager exists.**
+That is authentication *policy*, and it belongs to `luna-authmanager`, which
+keeps one budget across passcode, fingerprint and face:
+
+- A recognized face is answered with the unlock token luna-authmanager issues
+  (`issueBiometricToken`) for whoever called `identify`, posted as
+  `unlockToken` on that caller's subscription only (every other `identify`
+  subscriber gets the same update without it); the lock screen hands it to
+  `com.palm.display/control/setLockStatus`.
+  When luna-authmanager will not issue one (no passcode since boot, five misses
+  in a row, a passcode lockout, 72 h since the passcode was last entered) the
+  update carries `"passcodeRequired": true` instead.
+- An attempt that saw a face and did not match is reported
+  (`reportBiometricFailure`).
+- `enroll` takes `token`: the `unlockToken` luna-authmanager's
+  `matchDevicePasscode` gave the caller, spent (`consumeUnlockToken`, purpose
+  `"enroll"`) before the camera starts. Without a good one the reply is
+  `"Enrolling a face takes the passcode"`.
 
 ## Pipeline
 
@@ -73,8 +84,8 @@ a statistical one.
 | Method | Subscribable | Notes |
 |---|---|---|
 | `getStatus` | yes | `available`, `enrolled`, `state` |
-| `enroll` | yes | streams `progress` 0-100 and a `hint` (`noFace`, `multipleFaces`, `badLighting`) |
-| `identify` | yes | one time-boxed attempt (3 s), replies `recognized` |
+| `enroll` | yes | takes `token` (see above); streams `progress` 0-100 and a `hint` (`noFace`, `multipleFaces`, `badLighting`) |
+| `identify` | yes | one time-boxed attempt (3 s), replies `recognized`, with `unlockToken` or `passcodeRequired` on a match |
 | `abort` | no | cancels the running operation |
 | `clear` | no | removes the enrollment |
 
@@ -91,6 +102,12 @@ when it is not.
 `identify` does not distinguish a genuine mismatch from a spoof rejection.
 libfart does not report the difference, and telling an attacker which one it was
 would be a gift.
+
+## Tests
+
+`cmake -DBUILD_TESTING=ON` builds `faced-tests` (gtest): `src/identify_post.cpp`
+against a fake libluna-service2 (`tests/fake_ls2.cpp`), which checks that the
+unlock token goes to the identify caller's subscription and no other.
 
 ## Build dependencies
 

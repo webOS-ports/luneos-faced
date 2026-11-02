@@ -331,19 +331,29 @@ bool CameraSource::startOnce(int width, int height)
     width_  = width;
     height_ = height;
 
-    // The droid HAL plugin forces NV21 whatever we ask for; v4l2 devices honour
-    // the request. readFrameBgr() works out which it got from the frame size.
-    if (!call(std::string(kCameraService) + "/setFormat",
-              json{{"handle", handle_},
-                   {"params",
-                    {{"width", width}, {"height", height}, {"format", "YUV"}, {"fps", 30}}}}
-                  .dump(),
-              reply, nullptr, kStartTimeoutMs))
+    // The droid HAL plugin takes NV21 and refuses anything else; a v4l2 device
+    // may offer only packed YUV. readFrameBgr() works out which it got from the
+    // frame size.
+    bool formatSet = false;
+    for (const char *format : {"NV21", "YUV"})
     {
-        stop();
-        return false;
+        if (!call(std::string(kCameraService) + "/setFormat",
+                  json{{"handle", handle_},
+                       {"params",
+                        {{"width", width}, {"height", height}, {"format", format}, {"fps", 30}}}}
+                      .dump(),
+                  reply, nullptr, kStartTimeoutMs))
+        {
+            stop();
+            return false;
+        }
+        if (replyOk(reply, lastError_))
+        {
+            formatSet = true;
+            break;
+        }
     }
-    if (!replyOk(reply, lastError_))
+    if (!formatSet)
     {
         lastError_ = "setFormat failed: " + lastError_;
         stop();

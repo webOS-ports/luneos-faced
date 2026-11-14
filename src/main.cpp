@@ -11,7 +11,6 @@
 namespace
 {
 constexpr const char *kServiceName = "com.webos.service.faceunlock";
-constexpr const char *kModelDir    = "/usr/share/fart/models";
 constexpr const char *kStateDir    = "/var/lib/luneos-faced";
 
 GMainLoop *g_loop = nullptr;
@@ -46,9 +45,9 @@ int main(int, char **)
         return EXIT_FAILURE;
     }
 
-    // Models come from libfart's package; the template store is ours.
-    const char *modelDir = g_getenv("LUNEOS_FACED_MODEL_DIR");
-    FaceService service(handle, modelDir ? modelDir : kModelDir, kStateDir);
+    // biomd holds the template and the models; all that is ours is the
+    // learned camera orientation.
+    FaceService service(handle, kStateDir);
     if (!service.start())
         return EXIT_FAILURE;
 

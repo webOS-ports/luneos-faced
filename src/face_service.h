@@ -12,6 +12,10 @@
 // luna-authmanager issues for whoever asked to identify (or with
 // "passcodeRequired" when it will not), every miss is reported to it, and
 // enrolling takes a token from the passcode.
+//
+// Like webos-fingerprint-adapter it is also a bridge onto biomd: biomd holds
+// the enrolled template and runs the matcher, this daemon owns the camera and
+// the luna-service2 side and hands biomd the frames.
 
 #pragma once
 
@@ -23,14 +27,15 @@
 
 #include <luna-service2/lunaservice.h>
 
-#include "fart_engine.h"
-#include "template_store.h"
+#include "biomd_face.h"
 #include "frame_orientation.h"
 
 class FaceService
 {
 public:
-    FaceService(LSHandle *handle, std::string modelDir, std::string stateDir);
+    // stateDir keeps the learned camera orientation. biomdBus: the bus biomd
+    // is on, nullptr for the system bus.
+    FaceService(LSHandle *handle, std::string stateDir, GDBusConnection *biomdBus = nullptr);
     ~FaceService();
 
     bool start();
@@ -79,13 +84,15 @@ private:
     void post(const std::string &method, const std::string &payload);
     void postStatus();
 
+    // Removes what the daemon kept before biomd held the face: the encrypted
+    // template and its key.
+    void dropOldTemplate();
+
     LSHandle *handle_;
-    std::string modelDir_;
     std::string stateDir_;
 
-    FartEngine engine_;
+    BiomdFace biomd_;
     FrameOrientation orientation_;
-    TemplateStore store_;
 
     std::atomic<State> state_{State::Idle};
     std::atomic<bool> cancel_{false};

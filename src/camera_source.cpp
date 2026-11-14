@@ -3,7 +3,11 @@
 
 #include "camera_source.h"
 
+#include "camera_provider.h"
+
 #include <cerrno>
+#include <mutex>
+#include <vector>
 #include <glib.h>
 #include <nlohmann/json.hpp>
 #include <opencv2/imgproc.hpp>
@@ -17,13 +21,7 @@ namespace
 {
 constexpr const char *kCameraService = "luna://com.webos.service.camera2";
 constexpr const char *kAppId         = "com.webos.service.faceunlock";
-// LunaClient::callSync takes its timeout in MILLISECONDS, despite the header
-// defaulting it to 30 - which reads like seconds. It feeds the value straight to
-// LSCallSetTimeout (ms) and, when called off the main context, waits in a
-// g_usleep(1000) loop for that many iterations. Passing "5" here does not mean
-// five seconds, it means five milliseconds, and every call fails while the
-// camera service is answering correctly.
-constexpr int kCallTimeoutMs         = 5000;
+// Ordinary calls use call()'s default timeout; see camera_source.h for its unit.
 // open() cold-starts the vendor camera HAL through droidcamsrc, which takes far
 // longer than an ordinary call the first time. Giving up early is not harmless:
 // the service still completes the open, so we leak a handle we can no longer
@@ -74,18 +72,44 @@ bool replyOk(const std::string &reply, std::string &errOut)
 // Two goes only: each one pays the provider restart and its settle, so a third
 // would push a failing unlock past the point where the user has given up and
 // reached for the PIN.
+//
+// Only a board with that defect restarts the provider before every session; it
+// says so with the same file that opts it in to gst-droid's camera-droid-heal
+// for the defect at boot. Everywhere else a restart is a recovery step, taken
+// only before the retry of a start that failed: it costs the settle, and on a
+// healthy provider it buys nothing.
 constexpr int kStartAttempts     = 2;
 constexpr int kStartRetryPauseUs = 500000;
 
-constexpr const char *kProviderInitService = "vendor.camera-provider-2-4";
-constexpr int         kProviderSettleUs    = 3000000;
+constexpr const char *kHealConf         = "/etc/gst-droid/camera-heal.conf";
+constexpr int         kProviderSettleUs = 3000000;
 
 // The vendor HAL is a single global resource while a CameraSource is created per
 // attempt, so what we know about the provider has to outlive the object.
 gint64 g_providerRestartedAt = 0;
 bool   g_providerPrewarmed   = false;
 
-void spawnProviderRestart(bool synchronous)
+// Checked each time rather than once: on sargo luneos-device-config binds the
+// file in about 36 s into boot, which can be after the daemon has started.
+bool restartEverySession() { return g_file_test(kHealConf, G_FILE_TEST_EXISTS); }
+
+// Read from the container's init scripts. Kept once found; an empty result is
+// not kept, since the Android tree may not have been mounted yet.
+std::vector<std::string> providerServices()
+{
+    static std::mutex mutex;
+    static std::vector<std::string> services;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (services.empty())
+    {
+        services = camera_provider::findServices({"/android/vendor/etc/init", "/android/odm/etc/init"});
+        for (const auto &s : services)
+            g_message("camera: provider service %s", s.c_str());
+    }
+    return services;
+}
+
+void spawnProviderRestart(const std::string &service, bool synchronous)
 {
     pid_t pid = fork();
     if (pid == 0)
@@ -100,7 +124,7 @@ void spawnProviderRestart(bool synchronous)
         // across the exec is a descriptor the helper can never close.
         for (int fd = 3; fd < 256; ++fd)
             close(fd);
-        execl("/android/system/bin/setprop", "setprop", "ctl.restart", kProviderInitService,
+        execl("/android/system/bin/setprop", "setprop", "ctl.restart", service.c_str(),
               static_cast<char *>(nullptr));
         _exit(127);
     }
@@ -121,7 +145,11 @@ void spawnProviderRestart(bool synchronous)
 // the lock screen apparently doing nothing at all.
 void prewarmVendorCameraProvider()
 {
-    spawnProviderRestart(false);
+    const auto services = providerServices();
+    if (services.empty())
+        return;
+    for (const auto &s : services)
+        spawnProviderRestart(s, false);
     g_providerRestartedAt = g_get_monotonic_time();
     g_providerPrewarmed   = true;
 }
@@ -140,10 +168,20 @@ void restartVendorCameraProvider()
     }
     else
     {
-        spawnProviderRestart(true);
+        const auto services = providerServices();
+        if (services.empty())
+        {
+            // Nothing to restart, so nothing to wait for either.
+            g_message("camera: no camera provider service found, not restarting it");
+            return;
+        }
+        for (const auto &s : services)
+        {
+            spawnProviderRestart(s, true);
+            g_message("camera: restarted %s", s.c_str());
+        }
         g_providerRestartedAt = g_get_monotonic_time();
-        g_message("camera: restarted %s, settling %dms", kProviderInitService,
-                  kProviderSettleUs / 1000);
+        g_message("camera: settling %dms", kProviderSettleUs / 1000);
     }
 
     g_providerPrewarmed = false;
@@ -263,8 +301,8 @@ bool CameraSource::requestFd(const char *type, int &fdOut)
     return true;
 }
 
-// Every session tears the vendor HAL down and brings it back up (see
-// restartVendorCameraProvider), and doing that back to back races: the camera
+// On a board that restarts the vendor HAL around every session (see
+// restartVendorCameraProvider), doing that back to back races: the camera
 // service can still be unwinding the previous session while we open the next
 // one. It surfaces as one of several unrelated-looking errors - "startCamera
 // failed (code -1)", "getFd(buffer) returned no descriptor", even a failed
@@ -276,7 +314,7 @@ bool CameraSource::start(int width, int height)
 {
     for (int attempt = 1; attempt <= kStartAttempts; ++attempt)
     {
-        if (startOnce(width, height))
+        if (startOnce(width, height, attempt > 1 || restartEverySession()))
             return true;
 
         if (attempt < kStartAttempts)
@@ -291,14 +329,15 @@ bool CameraSource::start(int width, int height)
     return false;
 }
 
-bool CameraSource::startOnce(int width, int height)
+bool CameraSource::startOnce(int width, int height, bool restartProvider)
 {
     stop();
     lastError_.clear();
 
-    // Must happen before every open, not just the first: see
-    // restartVendorCameraProvider().
-    restartVendorCameraProvider();
+    // On a board with the stuck-sensor defect this happens before every open,
+    // not just the first; elsewhere only before a retry. See kStartAttempts.
+    if (restartProvider)
+        restartVendorCameraProvider();
 
     std::string id;
     if (!findFrontCamera(id))
@@ -471,7 +510,9 @@ void CameraSource::stop()
 
     // Only after a session that actually opened the camera: that is what leaves
     // the sensor stuck, and stop() also runs on paths that never got that far.
-    if (usedCamera)
+    // And only on a board with that defect: elsewhere the next session does not
+    // restart the provider first, so a pre-warm would only take it away.
+    if (usedCamera && restartEverySession())
         prewarmVendorCameraProvider();
 
     if (!keepError.empty())

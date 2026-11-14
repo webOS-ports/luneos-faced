@@ -8,13 +8,16 @@ Face authentication for the LuneOS lockscreen, served as `com.webos.service.face
 Description
 -----------
 Pulls frames from `com.webos.service.camera2` into shared memory without a
-preview, runs them through libfart, and reports whether the face in front of the
-camera matches the enrolled one.
+preview, hands them to biomd, which matches them against the enrolled face with
+libfart, and reports whether the face in front of the camera matches.
 
 ## What this is, and what it is not
 
 This is a **sensor adapter**, the same role `webos-fingerprint-adapter` plays for
-the fingerprint HAL. It answers one question — "does the face in front of the
+the fingerprint HAL, and like it, it is a bridge onto
+[biomd](https://github.com/FuriLabs/biomd): biomd owns the enrolled face and the
+matcher, as it owns the fingerprint HAL; this daemon owns the camera and the
+luna-service2 side. It answers one question — "does the face in front of the
 camera match the enrolled one?" — and nothing else.
 
 It deliberately does **not**:
@@ -49,16 +52,32 @@ com.webos.service.camera2   open(front) -> setFormat(640x480) -> startCamera
         v
 CameraSharedMemory          read() -> NV21 (droid HAL) or YUY2 (v4l2)
         v
-cv::cvtColor                -> BGR24
+cv::cvtColor, cv::rotate    -> BGR24, upright
+        v                   one sealed memfd per frame, ~6-7 a second
+biomd (io.FuriOS.Biomd)     Face agent: SubmitFrame(memfd, w, h, 3, BGR)
         v
 libfart                     detect -> MiniFASNet PAD -> MobileFaceNet -> match
         v
-TemplateStore               AES-256-GCM enrollment blob
+/var/lib/biomd/face.dat     AES-256-GCM enrollment blob
 ```
 
-Frames never touch the filesystem, and the enrollment template is encrypted at
-rest — a face embedding is invertible back into a recognisable face image, so a
-leaked template is close to leaking both the user's face and an unlock credential.
+Frames never touch the filesystem, only anonymous memfds, and biomd keeps the
+enrollment template encrypted at rest — a face embedding is invertible back into
+a recognisable face image, so a leaked template is close to leaking both the
+user's face and an unlock credential. The template never crosses the bus.
+
+biomd answers each `SubmitFrame` with the state of the newest frame it has
+finished, so its answers run a frame or so behind, and it reports a finished
+enrollment by refusing further frames with `FaceEnrolled` now true rather than
+with a state. `src/biomd_face.cpp` deals with both.
+
+### Camera orientation
+
+Nothing in the camera service says which way up the sensor is mounted, and
+libfart only finds upright faces. The first rotation under which biomd finds a
+face is learned and kept in `/var/lib/luneos-faced/orientation`; until then
+frames go out turned each way in turn, four answers per rotation. Twenty answers
+in a row without a face under the learned rotation start the sweep again.
 
 ## Security posture: this is Android "Class 1"
 
@@ -105,27 +124,42 @@ would be a gift.
 
 ## Tests
 
-`cmake -DBUILD_TESTING=ON` builds `faced-tests` (gtest): `src/identify_post.cpp`
-against a fake libluna-service2 (`tests/fake_ls2.cpp`), which checks that the
-unlock token goes to the identify caller's subscription and no other.
+`cmake -DBUILD_TESTING=ON` builds `faced-tests` and, apart so the first needs
+no opencv, `faced-orientation-tests` (gtest):
+
+- `src/identify_post.cpp` against a fake libluna-service2
+  (`tests/fake_ls2.cpp`), which checks that the unlock token goes to the
+  identify caller's subscription and no other;
+- `src/biomd_face.cpp` against a fake biomd on a private D-Bus
+  (`tests/fake_biomd.cpp`, GTestDBus): frames arrive intact, lagging answers,
+  enrollment completion, biomd leaving and coming back;
+- `src/frame_orientation.cpp`: the rotation sweep.
 
 ## Build dependencies
 
-`luna-service2`, `glib-2.0`, `opencv`, `openssl`, `nlohmann-json`, `libfart`
-(GPL-2.0-only, so this daemon is too) and `camera-utils` for
-`CameraSharedMemory` / `LunaClient`.
+`luna-service2`, `glib-2.0` (with gio), `opencv`, `nlohmann-json` and
+`camera-utils` for `CameraSharedMemory` / `LunaClient`. At runtime, biomd built
+with its face backend (`WITH_FACE=1`), which brings libfart and its models.
 
 ## Known gaps
 
 - **Camera arbitration.** If the camera app holds the device when the screen
   locks, `open` fails. The daemon fails soft and the shell must fall back to the
   PIN rather than presenting face unlock as broken.
-- **Template key.** The AES key currently sits in a root-only file next to the
-  ciphertext. It must move to passcode-derived material owned by
-  `luna-authmanager`, ideally wrapped by gatekeeper/keymaster on Halium. That
-  also gives "PIN required after boot" for free.
-- **`fart_create` with no prior enrollment.** We pass `{}` for the not-yet-enrolled
-  case; needs verifying against libfart on device.
+- **Template key.** biomd keeps the AES key in a root-only file next to the
+  ciphertext (`/var/lib/biomd/face.key`). It should move to passcode-derived
+  material owned by `luna-authmanager`, ideally wrapped by
+  gatekeeper/keymaster on Halium. That also gives "PIN required after boot"
+  for free; it now needs doing in biomd.
+- **Faces enrolled before biomd.** This daemon used to keep its own template
+  in `/var/lib/luneos-faced`. biomd cannot import it, so it is deleted on start
+  and the face has to be enrolled again.
+- **Orientation sweep.** Without a detector of its own the sweep takes the first
+  rotation biomd finds any face in, with no confidence score to compare, so a
+  weak detection of a sideways face could be learned. The re-sweep after twenty
+  faceless answers is the way out.
+- **biomd's bus policy** lets only root and one Droidian uid call it. This
+  daemon runs as root.
 - **camera2 outbound permissions.** If ls-hubd logs `LSHUB_NO_OUT_PERMS` for
   `com.webos.service.faceunlock`, add it to `outbound` in
   `com.webos.service.camera2.role.json.in`, exactly as LuneOS already does for

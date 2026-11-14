@@ -1,14 +1,17 @@
 [Unit]
 Description=LuneOS face unlock service
 Requires=ls-hubd.service
-After=ls-hubd.service com.webos.service.camera.service
-Wants=com.webos.service.camera.service
+# biomd holds the face template and runs the matcher; without it the service
+# answers available=false and picks biomd up when it appears.
+After=ls-hubd.service com.webos.service.camera.service biomd.service
+Wants=com.webos.service.camera.service biomd.service
 
 [Service]
 Type=simple
 Restart=on-failure
 ExecStart=/usr/sbin/luneos-faced
-# Templates and the data key live here, root-only.
+# The learned camera orientation lives here. The face template is biomd's,
+# under /var/lib/biomd.
 StateDirectory=luneos-faced
 StateDirectoryMode=0700
 

@@ -8,7 +8,11 @@
 
 #include <string.h> // explicit_bzero
 
+#include <chrono>
+#include <thread>
+
 #include <glib.h>
+#include <glib/gstdio.h>
 #include <nlohmann/json.hpp>
 #include <opencv2/imgcodecs.hpp>
 
@@ -24,12 +28,9 @@ constexpr int kEnrollBudgetMs   = 30000;
 constexpr int kFrameTimeoutMs   = 2000;
 constexpr int kWidth            = 640;
 constexpr int kHeight           = 480;
-
-// How many consecutive faceless frames mean the learned sensor rotation is
-// wrong rather than the user simply being out of shot. Generous on purpose: a
-// wrong rotation fails every frame forever, so paying for a re-sweep now and
-// then costs far less than never recovering.
-constexpr int kRecalibrateAfter = 20;
+// How long to wait for biomd's answer after handing it a frame. It answers as
+// part of taking the frame, so this is only a ceiling for a stalled biomd.
+constexpr int kAnswerWaitMs     = 500;
 
 struct PostJob
 {
@@ -104,6 +105,60 @@ struct EnrollJob
     LSHandle *handle;
     LSMessage *message;
 };
+
+// Whether biomd's answer means it found a face in the frame, which is what
+// FrameOrientation learns the sensor angle from. A plain failure is not: it is
+// also what biomd reports before it has finished any frame.
+bool recognitionSawFace(uint32_t state)
+{
+    return state == BiomdFace::RecognitionMultipleFaces ||
+           state == BiomdFace::RecognitionRecognized ||
+           state == BiomdFace::RecognitionNotRecognized;
+}
+
+bool enrollmentSawFace(uint32_t state)
+{
+    return state == BiomdFace::EnrollmentInProgress || state == BiomdFace::EnrollmentComplete ||
+           state == BiomdFace::EnrollmentMultipleFaces ||
+           state == BiomdFace::EnrollmentBadLighting;
+}
+
+const char *recognitionName(uint32_t state)
+{
+    switch (state)
+    {
+    case BiomdFace::RecognitionRecognized:
+        return "recognized";
+    case BiomdFace::RecognitionNoFace:
+        return "noFace";
+    case BiomdFace::RecognitionNotRecognized:
+        return "notRecognized/spoof";
+    case BiomdFace::RecognitionMultipleFaces:
+        return "multipleFaces";
+    case BiomdFace::RecognitionNotEnrolled:
+        return "notEnrolled";
+    default:
+        return "other";
+    }
+}
+
+// Holds frames back to biomd's pace: it queues whatever it is given, and a
+// queue that grows only makes every answer later.
+class Pacer
+{
+public:
+    void wait()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (last_ != std::chrono::steady_clock::time_point{} && now < last_ + kInterval)
+            std::this_thread::sleep_for(last_ + kInterval - now);
+        last_ = std::chrono::steady_clock::now();
+    }
+
+private:
+    static constexpr std::chrono::milliseconds kInterval{BiomdFace::kSubmitIntervalMs};
+    std::chrono::steady_clock::time_point last_{};
+};
 } // namespace
 
 const char *FaceService::stateName(State s)
@@ -119,9 +174,9 @@ const char *FaceService::stateName(State s)
     }
 }
 
-FaceService::FaceService(LSHandle *handle, std::string modelDir, std::string stateDir)
-    : handle_(handle), modelDir_(std::move(modelDir)), stateDir_(std::move(stateDir)),
-      orientation_(stateDir_), store_(stateDir_), context_(g_main_context_default())
+FaceService::FaceService(LSHandle *handle, std::string stateDir, GDBusConnection *biomdBus)
+    : handle_(handle), stateDir_(std::move(stateDir)), biomd_(biomdBus), orientation_(stateDir_),
+      context_(g_main_context_default())
 {
     orientation_.load();
 }
@@ -129,8 +184,25 @@ FaceService::FaceService(LSHandle *handle, std::string modelDir, std::string sta
 FaceService::~FaceService()
 {
     cancel_ = true;
+    biomd_.interrupt();
     if (worker_.joinable())
         worker_.join();
+}
+
+void FaceService::dropOldTemplate()
+{
+    // Before biomd held the face, this daemon kept the template here, encrypted
+    // under a key next to it. biomd cannot import it, so it is of no use now,
+    // and a face template is not something to leave lying around.
+    bool removed = false;
+    for (const char *name : {"templates.enc", ".key"})
+    {
+        const std::string path = stateDir_ + "/" + name;
+        if (g_remove(path.c_str()) == 0)
+            removed = true;
+    }
+    if (removed)
+        g_message("removed the face template kept before biomd; the face needs enrolling again");
 }
 
 bool FaceService::start()
@@ -159,15 +231,12 @@ bool FaceService::start()
         return false;
     }
 
-    std::string enrollment;
-    if (!store_.load(enrollment))
-        g_warning("template store: %s", store_.lastError().c_str());
+    dropOldTemplate();
 
-    if (!engine_.init(modelDir_, enrollment))
-    {
-        g_warning("libfart unavailable; the service will report available=false");
-        return true; // still register, so callers get a clean "unavailable"
-    }
+    // biomd not running yet is fine: getStatus reports available=false until
+    // it appears, so callers get a clean "unavailable".
+    if (!biomd_.start([this] { postStatus(); }))
+        g_warning("no system bus; the service will report available=false");
     return true;
 }
 
@@ -242,8 +311,8 @@ void FaceService::post(const std::string &method, const std::string &payload)
 void FaceService::postStatus()
 {
     post("getStatus", json{{"returnValue", true},
-                            {"available", engine_.ready()},
-                            {"enrolled", engine_.isEnrolled()},
+                            {"available", biomd_.available()},
+                            {"enrolled", biomd_.enrolled()},
                             {"state", stateName(state_.load())}}
                            .dump());
 }
@@ -297,12 +366,23 @@ void FaceService::runIdentify(LSMessage *call)
         }
     } ref{this, call};
 
+    std::string error;
+    if (!biomd_.begin(BiomdFace::Mode::Recognize, error))
+    {
+        g_warning("identify: biomd: %s", error.c_str());
+        post("identify",
+             json{{"returnValue", false}, {"state", "unavailable"}, {"errorText", error}}.dump());
+        finish();
+        return;
+    }
+
     CameraSource camera(handle_);
     if (!camera.start(kWidth, kHeight))
     {
         // Most often the camera app holds the device. Fail soft: the lockscreen
         // falls back to the passcode rather than presenting face unlock as broken.
         g_warning("identify: camera unavailable: %s", camera.lastError().c_str());
+        biomd_.end();
         post("identify", json{{"returnValue", false},
                                {"state", "unavailable"},
                                {"errorText", camera.lastError()}}
@@ -313,23 +393,30 @@ void FaceService::runIdentify(LSMessage *call)
 
     const gint64 deadline = g_get_monotonic_time() + kIdentifyBudgetMs * 1000;
     cv::Mat raw, bgr;
-    RecognitionState last = RECOGNITION_IDLE;
-    int blindFrames = 0;
-    int idFrames = 0;
+    uint32_t last = BiomdFace::RecognitionIdle;
+    bool lost     = false;
+    int idFrames  = 0;
+    Pacer pacer;
     const char *idDumpDir = g_getenv("FACED_DUMP_DIR");
 
     while (!cancel_ && g_get_monotonic_time() < deadline)
     {
+        pacer.wait();
         if (!camera.readFrameBgr(raw, kFrameTimeoutMs))
             break;
 
-        // Normally already learned during enrollment; this covers a template
-        // restored onto a device whose camera sits at a different angle.
-        if (!orientation_.calibrated())
-            orientation_.calibrate(engine_, raw);
+        // Normally already learned during enrollment; this covers a device
+        // whose camera sits at an angle nothing has seen yet.
         orientation_.apply(raw, bgr);
+        if (!bgr.isContinuous())
+            bgr = bgr.clone();
 
-        last = engine_.recognize(bgr.data, bgr.cols, bgr.rows);
+        const BiomdFace::Result r = biomd_.submit(bgr.data, bgr.cols, bgr.rows, kAnswerWaitMs);
+        if (r.lost)
+        {
+            lost = true;
+            break;
+        }
 
         // Tell the lock screen the moment frames start arriving. Until now it
         // showed "Looking for your face..." for the whole attempt, including the
@@ -343,21 +430,14 @@ void FaceService::runIdentify(LSMessage *call)
         // diagnosable if we can see which frames the matcher rejected and what
         // they looked like. RECOGNITION_NOT_RECOGNIZED covers both a genuine
         // mismatch and an anti-spoof rejection, so the frame itself is the only
-        // way to tell a dark or half-converged exposure from a real miss.
-        // Per-frame detail is diagnostic only: a dozen lines per unlock attempt
-        // would drown the journal in normal use. The summary line at the end of
-        // the attempt is what stays on.
+        // way to tell a dark or half-converged exposure from a real miss. The
+        // state logged with a frame is biomd's newest answer, which may belong
+        // to the frame before it.
         if (idDumpDir && idFrames < 12)
         {
             const cv::Scalar m = cv::mean(bgr);
-            g_message("identify: frame %d %dx%d mean=%.0f state=%d (%s)", idFrames, bgr.cols,
-                      bgr.rows, (m[0] + m[1] + m[2]) / 3.0, static_cast<int>(last),
-                      last == RECOGNITION_RECOGNIZED       ? "recognized"
-                      : last == RECOGNITION_NO_FACE        ? "noFace"
-                      : last == RECOGNITION_NOT_RECOGNIZED ? "notRecognized/spoof"
-                      : last == RECOGNITION_MULTIPLE_FACES ? "multipleFaces"
-                      : last == RECOGNITION_NOT_ENROLLED   ? "notEnrolled"
-                                                           : "other");
+            g_message("identify: frame %d %dx%d mean=%.0f state=%u (%s)", idFrames, bgr.cols,
+                      bgr.rows, (m[0] + m[1] + m[2]) / 3.0, r.state, recognitionName(r.state));
 
             char *path = g_strdup_printf("%s/identify-%d.png", idDumpDir, idFrames);
             cv::imwrite(path, bgr);
@@ -365,43 +445,48 @@ void FaceService::runIdentify(LSMessage *call)
         }
         ++idFrames;
 
-        if (last == RECOGNITION_NO_FACE)
-        {
-            if (orientation_.calibrated() && ++blindFrames >= kRecalibrateAfter)
-            {
-                orientation_.invalidate();
-                blindFrames = 0;
-            }
-        }
-        else
-        {
-            blindFrames = 0;
-        }
-        if (last == RECOGNITION_RECOGNIZED)
+        if (!r.haveState)
+            continue;
+        last = r.state;
+        orientation_.observe(recognitionSawFace(last));
+
+        if (last == BiomdFace::RecognitionRecognized)
         {
             const gint64 matchedAt = g_get_monotonic_time();
             // Posted once luna-authmanager has answered, with its token
             onMainLoop([this, c = ref.release()] { requestUnlockToken(c); });
             camera.stop();
+            biomd_.end();
             g_message("identify: recognized, teardown took %" G_GINT64_FORMAT "ms",
                       (g_get_monotonic_time() - matchedAt) / 1000);
             finish();
             return;
         }
-        if (last == RECOGNITION_NOT_ENROLLED)
+        if (last == BiomdFace::RecognitionNotEnrolled)
             break;
     }
 
     camera.stop();
+    biomd_.end();
 
-    g_message("identify: finished after %d frames, last state %d", idFrames,
-              static_cast<int>(last));
+    g_message("identify: finished after %d frames, last state %u%s", idFrames, last,
+              cancel_ ? " (aborted)" : lost ? " (biomd went away)" : "");
 
-    const char *reason = cancel_             ? "aborted"
-                         : last == RECOGNITION_NOT_ENROLLED ? "notEnrolled"
-                         : last == RECOGNITION_NO_FACE      ? "noFace"
-                         : last == RECOGNITION_MULTIPLE_FACES ? "multipleFaces"
-                                                              : "notRecognized";
+    if (lost && !cancel_)
+    {
+        post("identify", json{{"returnValue", false},
+                               {"state", "unavailable"},
+                               {"errorText", "biomd went away"}}
+                              .dump());
+        finish();
+        return;
+    }
+
+    const char *reason = cancel_                                    ? "aborted"
+                         : last == BiomdFace::RecognitionNotEnrolled  ? "notEnrolled"
+                         : last == BiomdFace::RecognitionNoFace       ? "noFace"
+                         : last == BiomdFace::RecognitionMultipleFaces ? "multipleFaces"
+                                                                      : "notRecognized";
 
     // NOTE: a "not recognized" here covers both a genuine mismatch and a
     // presentation-attack rejection from MiniFASNet. libfart does not
@@ -409,7 +494,7 @@ void FaceService::runIdentify(LSMessage *call)
     // would be a gift, so the shell should treat both the same.
     // A face that was seen and did not match counts against the budget
     // luna-authmanager shares with the fingerprint and the passcode.
-    if (!cancel_ && last == RECOGNITION_NOT_RECOGNIZED)
+    if (!cancel_ && last == BiomdFace::RecognitionNotRecognized)
         onMainLoop([this] { reportFailure(); });
     post("identify",
          json{{"returnValue", true}, {"recognized", false}, {"reason", reason}}.dump());
@@ -418,10 +503,29 @@ void FaceService::runIdentify(LSMessage *call)
 
 void FaceService::runEnroll()
 {
+    std::string error;
+    // A new enrollment replaces the old face. biomd keeps one and will not
+    // start enrolling while it has it; the caller has just given the passcode.
+    if (biomd_.enrolled() && !biomd_.removeFaceData(error))
+    {
+        g_warning("enroll: cannot remove the enrolled face: %s", error.c_str());
+        post("enroll", json{{"returnValue", false}, {"errorText", error}}.dump());
+        finish();
+        return;
+    }
+    if (!biomd_.begin(BiomdFace::Mode::Enroll, error))
+    {
+        g_warning("enroll: biomd: %s", error.c_str());
+        post("enroll", json{{"returnValue", false}, {"errorText", error}}.dump());
+        finish();
+        return;
+    }
+
     CameraSource camera(handle_);
     if (!camera.start(kWidth, kHeight))
     {
         g_warning("enroll: camera unavailable: %s", camera.lastError().c_str());
+        biomd_.end();
         post("enroll", json{{"returnValue", false}, {"errorText", camera.lastError()}}.dump());
         finish();
         return;
@@ -429,99 +533,91 @@ void FaceService::runEnroll()
 
     const gint64 deadline = g_get_monotonic_time() + kEnrollBudgetMs * 1000;
     cv::Mat raw, bgr;
-    int progress = 0, lastPosted = -1;
-    int blindFrames = 0;
+    int lastPosted       = -1;
+    const char *failure  = nullptr;
+    Pacer pacer;
 
     // Diagnostics: with FACED_DUMP_DIR set we write the first few frames exactly
-    // as they are handed to libfart, plus the state it returned for each. A
-    // detector that reports noFace on a frame the camera clearly filled is a
-    // very different bug from one that never gets a frame at all, and the dump
-    // is the only way to tell them apart from off-device.
+    // as they are handed to biomd, plus the state it answered with. A detector
+    // that reports noFace on a frame the camera clearly filled is a very
+    // different bug from one that never gets a frame at all, and the dump is
+    // the only way to tell them apart from off-device.
     const char *dumpDir = g_getenv("FACED_DUMP_DIR");
-    int         dumped  = 0;
+    int dumped          = 0;
 
     while (!cancel_ && g_get_monotonic_time() < deadline)
     {
+        pacer.wait();
         if (!camera.readFrameBgr(raw, kFrameTimeoutMs))
             break;
 
         // Enrollment is the one moment we can count on the user looking straight
         // at the camera, so it is the best chance to learn the sensor angle.
-        if (!orientation_.calibrated())
-            orientation_.calibrate(engine_, raw);
         orientation_.apply(raw, bgr);
+        if (!bgr.isContinuous())
+            bgr = bgr.clone();
 
-        EnrollmentState st = engine_.enroll(bgr.data, bgr.cols, bgr.rows, &progress);
-
-        // A calibrated rotation that stops yielding faces is a rotation we got
-        // wrong. Throw it away and re-learn rather than failing every attempt
-        // from here on.
-        if (st == ENROLLMENT_NO_FACE)
-        {
-            if (orientation_.calibrated() && ++blindFrames >= kRecalibrateAfter)
-            {
-                g_message("enroll: %d frames without a face, re-learning orientation",
-                          blindFrames);
-                orientation_.invalidate();
-                blindFrames = 0;
-            }
-        }
-        else
-        {
-            blindFrames = 0;
-        }
+        const BiomdFace::Result r = biomd_.submit(bgr.data, bgr.cols, bgr.rows, kAnswerWaitMs);
 
         if (dumpDir && dumped < 6)
         {
             char *path = g_strdup_printf("%s/enroll-%d.png", dumpDir, dumped);
             cv::imwrite(path, bgr);
             const cv::Scalar m = cv::mean(bgr);
-            g_message("enroll: frame %d %dx%d mean(B,G,R)=(%.0f,%.0f,%.0f) state=%d -> %s", dumped,
-                      bgr.cols, bgr.rows, m[0], m[1], m[2], static_cast<int>(st), path);
+            g_message("enroll: frame %d %dx%d mean(B,G,R)=(%.0f,%.0f,%.0f) state=%u -> %s", dumped,
+                      bgr.cols, bgr.rows, m[0], m[1], m[2], r.state, path);
             g_free(path);
             ++dumped;
         }
 
-        if (progress != lastPosted)
+        if (r.enrolled)
         {
-            lastPosted = progress;
-            const char *hint = st == ENROLLMENT_NO_FACE          ? "noFace"
-                               : st == ENROLLMENT_MULTIPLE_FACES ? "multipleFaces"
-                               : st == ENROLLMENT_BAD_LIGHTING   ? "badLighting"
-                                                                 : "ok";
+            camera.stop();
+            biomd_.end();
+            post("enroll",
+                 json{{"returnValue", true}, {"progress", 100}, {"completed", true}}.dump());
+            finish();
+            return;
+        }
+        if (r.lost)
+        {
+            failure = "biomd went away";
+            break;
+        }
+        if (!r.haveState)
+            continue;
+
+        orientation_.observe(enrollmentSawFace(r.state));
+
+        // biomd stored nothing; going on would only fail the same way.
+        if (r.state == BiomdFace::EnrollmentSaveFailed)
+        {
+            failure = "could not persist template";
+            break;
+        }
+
+        if (r.progress != lastPosted)
+        {
+            lastPosted = r.progress;
+            const char *hint = r.state == BiomdFace::EnrollmentNoFace          ? "noFace"
+                               : r.state == BiomdFace::EnrollmentMultipleFaces ? "multipleFaces"
+                               : r.state == BiomdFace::EnrollmentBadLighting   ? "badLighting"
+                                                                                : "ok";
             post("enroll", json{{"returnValue", true},
-                                 {"progress", progress},
+                                 {"progress", r.progress},
                                  {"hint", hint},
                                  {"completed", false}}
                                 .dump());
         }
-
-        if (st == ENROLLMENT_COMPLETE)
-        {
-            camera.stop();
-            const std::string blob = engine_.exportEnrollment();
-            if (blob.empty() || !store_.save(blob))
-            {
-                post("enroll", json{{"returnValue", false},
-                                     {"errorText", "could not persist template"}}
-                                    .dump());
-            }
-            else
-            {
-                post("enroll",
-                     json{{"returnValue", true}, {"progress", 100}, {"completed", true}}.dump());
-            }
-            finish();
-            return;
-        }
-        if (st == ENROLLMENT_FAIL || st == ENROLLMENT_SAVE_FAILED)
-            break;
     }
 
     camera.stop();
+    biomd_.end();
     post("enroll", json{{"returnValue", false},
                          {"completed", false},
-                         {"errorText", cancel_ ? "aborted" : "enrollment did not complete"}}
+                         {"errorText", cancel_    ? "aborted"
+                                       : failure ? failure
+                                                 : "enrollment did not complete"}}
                         .dump());
     finish();
 }
@@ -540,8 +636,8 @@ bool FaceService::cbGetStatus(LSHandle *sh, LSMessage *msg, void *ctx)
     }
 
     const std::string reply = json{{"returnValue", true},
-                                   {"available", self->engine_.ready()},
-                                   {"enrolled", self->engine_.isEnrolled()},
+                                   {"available", self->biomd_.available()},
+                                   {"enrolled", self->biomd_.enrolled()},
                                    {"state", stateName(self->state_.load())}}
                                   .dump();
     if (!LSMessageReply(sh, msg, reply.c_str(), &err))
@@ -555,7 +651,7 @@ bool FaceService::cbEnroll(LSHandle *sh, LSMessage *msg, void *ctx)
     LSError err;
     LSErrorInit(&err);
 
-    if (!self->engine_.ready())
+    if (!self->biomd_.available())
     {
         LSMessageReply(sh, msg, errorReply("face engine unavailable").c_str(), &err);
         return true;
@@ -634,12 +730,12 @@ bool FaceService::cbIdentify(LSHandle *sh, LSMessage *msg, void *ctx)
     LSError err;
     LSErrorInit(&err);
 
-    if (!self->engine_.ready())
+    if (!self->biomd_.available())
     {
         LSMessageReply(sh, msg, errorReply("face engine unavailable").c_str(), &err);
         return true;
     }
-    if (!self->engine_.isEnrolled())
+    if (!self->biomd_.enrolled())
     {
         LSMessageReply(sh, msg, errorReply("no face enrolled").c_str(), &err);
         return true;
@@ -661,6 +757,7 @@ bool FaceService::cbAbort(LSHandle *sh, LSMessage *msg, void *ctx)
 {
     auto *self = static_cast<FaceService *>(ctx);
     self->cancel_ = true;
+    self->biomd_.interrupt();
     LSError err;
     LSErrorInit(&err);
     LSMessageReply(sh, msg, json{{"returnValue", true}}.dump().c_str(), &err);
@@ -679,7 +776,12 @@ bool FaceService::cbClear(LSHandle *sh, LSMessage *msg, void *ctx)
         return true;
     }
 
-    const bool okay = self->store_.clear() && self->engine_.clearEnrollment();
+    // Blocks the main loop for a few calls to biomd; clear is rare and biomd
+    // answers at once.
+    std::string error;
+    const bool okay = self->biomd_.removeFaceData(error);
+    if (!okay)
+        g_warning("clear: %s", error.c_str());
     LSMessageReply(sh, msg,
                    okay ? json{{"returnValue", true}}.dump().c_str()
                         : errorReply("could not clear enrollment").c_str(),

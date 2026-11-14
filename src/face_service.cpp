@@ -469,7 +469,8 @@ void FaceService::runIdentify(LSMessage *call)
     camera.stop();
     biomd_.end();
 
-    g_message("identify: finished after %d frames, last state %u", idFrames, last);
+    g_message("identify: finished after %d frames, last state %u%s", idFrames, last,
+              cancel_ ? " (aborted)" : lost ? " (biomd went away)" : "");
 
     if (lost && !cancel_)
     {

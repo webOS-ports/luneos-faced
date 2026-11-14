@@ -44,7 +44,8 @@ public:
 
 private:
     // One attempt at bringing the camera up; start() wraps this in a retry.
-    bool startOnce(int width, int height);
+    // restartProvider: restart the vendor camera provider first.
+    bool startOnce(int width, int height, bool restartProvider);
 
     // Picks the front-facing camera from getCameraList()/getInfo(). The droid
     // notifier announces devices as droid:<n> and names them "Droid front
@@ -52,6 +53,12 @@ private:
     // first device.
     bool findFrontCamera(std::string &idOut);
     bool requestFd(const char *type, int &fdOut);
+    // timeoutMs is in MILLISECONDS, as LunaClient::callSync takes it, despite
+    // that header defaulting it to 30 - which reads like seconds. It feeds the
+    // value straight to LSCallSetTimeout (ms) and, when called off the main
+    // context, waits in a g_usleep(1000) loop for that many iterations. Passing
+    // "5" does not mean five seconds, it means five milliseconds, and every call
+    // fails while the camera service is answering correctly.
     bool call(const std::string &uri, const std::string &payload, std::string &reply,
               int *fd = nullptr, int timeoutMs = 5000);
 

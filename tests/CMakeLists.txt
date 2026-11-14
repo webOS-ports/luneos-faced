@@ -14,10 +14,12 @@ pkg_check_modules(GTEST REQUIRED gtest_main)
 add_executable(faced-tests
     test_identify_post.cpp
     test_biomd_face.cpp
+    test_camera_provider.cpp
     fake_ls2.cpp
     fake_biomd.cpp
     ${CMAKE_SOURCE_DIR}/src/identify_post.cpp
-    ${CMAKE_SOURCE_DIR}/src/biomd_face.cpp)
+    ${CMAKE_SOURCE_DIR}/src/biomd_face.cpp
+    ${CMAKE_SOURCE_DIR}/src/camera_provider.cpp)
 target_include_directories(faced-tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR} ${GTEST_INCLUDE_DIRS})
 target_compile_options(faced-tests PRIVATE -Wall -Wextra)
